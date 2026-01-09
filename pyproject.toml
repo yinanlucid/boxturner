@@ -18,6 +18,7 @@ packages = [{ include = "boxturner", from = "src" }]
 [tool.poetry.scripts]
 boxturner-gpio = "boxturner.gpio:main"
 boxturner-pusher = "boxturner.pusher:main"
+boxturner-sealer = "boxturner.sealer:main"
 boxturner-main = "boxturner.main:main"
 
 [build-system]
