@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
 Main Sequencer Service (fail-fast)
-
-Responsibilities:
-- Verify GPIO and Pusher heartbeats on startup
-- Coordinate arm / vacuum / pusher2
-- Execute measurement pipeline
-- Handle queued boxes correctly
-- Publish reduced machine state via MQTT (async, aiomqtt)
-- Kill process if GPIO or Pusher heartbeat is lost
-- Detect missing box between pusher2 release and sensor3 rise
 """
 
 from __future__ import annotations
@@ -49,6 +40,11 @@ GPIO_REP_ADDR = "tcp://127.0.0.1:5557"
 PUSHER_PUB_ADDR = "tcp://127.0.0.1:5560"
 PUSHER_HEARTBEAT_TOPIC = b"pusher.heartbeat"
 
+SEALER_PUB_ADDR = "tcp://127.0.0.1:5571"
+SEALER_HEARTBEAT_TOPIC = b"sealer.heartbeat"
+
+SEALER_INTENT_ADDR = "tcp://127.0.0.1:5570"
+
 
 # =============================================================================
 # MQTT CONFIG
@@ -64,6 +60,7 @@ MQTT_TOPIC_STATE = "lucid/boxturner/state"
 # =============================================================================
 
 HEALTH_TIMEOUT_SEC = 5.0
+STARTUP_GRACE_SEC = 5.0
 BOX_MISSING_TIMEOUT_SEC = 10.0
 
 
@@ -71,7 +68,6 @@ BOX_MISSING_TIMEOUT_SEC = 10.0
 # TIMING CONFIG
 # =============================================================================
 
-ARM_SETTLE_DELAY_SEC = 0.5
 VACUUM_HOLD_DELAY_SEC = 1.0
 POST_MEASUREMENT_DELAY_SEC = 0.5
 RUNNING_RESET_DELAY_SEC = 1.0
@@ -94,6 +90,8 @@ VACUUM = "vacuum"
 # STATE
 # =============================================================================
 
+start_ts = time.monotonic()
+
 last_gpio_values: Dict[str, int] | None = None
 last_published_state: Dict[str, Any] | None = None
 
@@ -103,10 +101,12 @@ running: bool = False
 
 last_gpio_seen_ts: float | None = None
 last_pusher_seen_ts: float | None = None
+last_sealer_seen_ts: float | None = None
 
 health_main: bool = True
 health_gpio: bool = True
 health_pusher: bool = True
+health_sealer: bool = True
 
 box_expected_by_ts: float | None = None
 
@@ -124,16 +124,22 @@ def falling_edge(prev: int, curr: int) -> bool:
     return prev == 1 and curr == 0
 
 
-def measure_horizontal() -> int:
-    value = random.randint(10, 100)
-    log.info("Measured horizontal = %d", value)
-    return value
+def measure_horizontal() -> int | None:
+    if random.random() < 0.05:
+        log.error("Horizontal measurement failed")
+        return None
+    val = random.randint(10, 100)
+    log.info("Measured horizontal = %d", val)
+    return val
 
 
-def measure_diagonal() -> int:
-    value = random.randint(10, 100)
-    log.info("Measured diagonal = %d", value)
-    return value
+def measure_diagonal() -> int | None:
+    if random.random() < 0.05:
+        log.error("Diagonal measurement failed")
+        return None
+    val = random.randint(10, 100)
+    log.info("Measured diagonal = %d", val)
+    return val
 
 
 async def gpio_set(sock: zmq.asyncio.Socket, pin: str, value: bool) -> None:
@@ -142,6 +148,40 @@ async def gpio_set(sock: zmq.asyncio.Socket, pin: str, value: bool) -> None:
     reply = await sock.recv_json()
     if reply.get("ok") is not True:
         raise RuntimeError(f"GPIO set failed: {reply}")
+
+
+async def push_intent(sock: zmq.asyncio.Socket, action: str) -> None:
+    payload = {
+        "action": action,
+        "ts_ms": int(time.time() * 1000),
+    }
+    await sock.send(json.dumps(payload).encode())
+    log.info("INTENT PUSHED: %s", action)
+
+
+async def wait_for_sensor3_drop() -> None:
+    while last_gpio_values and last_gpio_values.get(SENSOR3, 0) == 1:
+        await asyncio.sleep(0.05)
+
+
+async def reject_and_reset(
+    req: zmq.asyncio.Socket,
+    intent_sock: zmq.asyncio.Socket,
+) -> None:
+    global running, horizontal, diagonal
+
+    log.warning("Rejecting box")
+
+    await push_intent(intent_sock, "reject")
+    await gpio_set(req, VACUUM, False)
+    await gpio_set(req, ARM, False)
+
+    await wait_for_sensor3_drop()
+    await asyncio.sleep(RUNNING_RESET_DELAY_SEC)
+
+    running = False
+    horizontal = None
+    diagonal = None
 
 
 # =============================================================================
@@ -162,6 +202,7 @@ async def publish_state_if_changed(
             "main": health_main,
             "gpio": health_gpio,
             "pusher": health_pusher,
+            "sealer": health_sealer,
         },
     }
 
@@ -189,22 +230,35 @@ async def publish_state_if_changed(
 
 
 async def health_watchdog(mqtt: aiomqtt.Client) -> None:
-    global health_gpio, health_pusher, health_main
+    global health_gpio, health_pusher, health_sealer, health_main
 
     while True:
         await asyncio.sleep(0.5)
         now = time.monotonic()
+        past_grace = now - start_ts > STARTUP_GRACE_SEC
+
+        if past_grace:
+            if last_gpio_seen_ts is None:
+                health_gpio = False
+            if last_pusher_seen_ts is None:
+                health_pusher = False
+            if last_sealer_seen_ts is None:
+                health_sealer = False
 
         if last_gpio_seen_ts and now - last_gpio_seen_ts > HEALTH_TIMEOUT_SEC:
             health_gpio = False
-
         if (
             last_pusher_seen_ts
             and now - last_pusher_seen_ts > HEALTH_TIMEOUT_SEC
         ):
             health_pusher = False
+        if (
+            last_sealer_seen_ts
+            and now - last_sealer_seen_ts > HEALTH_TIMEOUT_SEC
+        ):
+            health_sealer = False
 
-        if not health_gpio or not health_pusher:
+        if not health_gpio or not health_pusher or not health_sealer:
             health_main = False
             log.critical("Health failure detected, shutting down")
             await publish_state_if_changed(mqtt, last_gpio_values or {})
@@ -214,6 +268,7 @@ async def health_watchdog(mqtt: aiomqtt.Client) -> None:
 async def box_missing_watchdog(
     mqtt: aiomqtt.Client,
     gpio_req: zmq.asyncio.Socket,
+    intent_sock: zmq.asyncio.Socket,
 ) -> None:
     global box_expected_by_ts, running
 
@@ -228,10 +283,11 @@ async def box_missing_watchdog(
 
         log.error("Box missing: sensor3 timeout")
 
+        await push_intent(intent_sock, "reject")
         await gpio_set(gpio_req, ARM, False)
         await asyncio.sleep(RUNNING_RESET_DELAY_SEC)
+
         running = False
-        log.info("Running=False")
         box_expected_by_ts = None
 
         await publish_state_if_changed(mqtt, last_gpio_values or {})
@@ -254,7 +310,6 @@ async def start_measurement_sequence(
         return
 
     running = True
-    log.info("Running=True")
     await publish_state_if_changed(mqtt, last_gpio_values or {})
 
     await gpio_set(req, ARM, True)
@@ -274,8 +329,8 @@ async def gpio_listener(
     ctx: zmq.asyncio.Context,
     mqtt: aiomqtt.Client,
 ) -> None:
-    global last_gpio_values, diagonal, running, last_gpio_seen_ts
-    global box_expected_by_ts
+    global last_gpio_values, diagonal, horizontal, running
+    global last_gpio_seen_ts, box_expected_by_ts
 
     sub = ctx.socket(zmq.SUB)
     sub.connect(GPIO_PUB_ADDR)
@@ -284,16 +339,21 @@ async def gpio_listener(
     req = ctx.socket(zmq.REQ)
     req.connect(GPIO_REP_ADDR)
 
-    watchdog = asyncio.create_task(box_missing_watchdog(mqtt, req))
+    intent_sock = ctx.socket(zmq.PUSH)
+    intent_sock.connect(SEALER_INTENT_ADDR)
+
+    watchdog = asyncio.create_task(
+        box_missing_watchdog(mqtt, req, intent_sock)
+    )
 
     try:
         while True:
             _, raw = await sub.recv_multipart()
             last_gpio_seen_ts = time.monotonic()
 
-            msg = json.loads(raw.decode("utf-8"))
+            msg = json.loads(raw.decode())
             gpio_values = {
-                pin: int(data["value"]) for pin, data in msg["pins"].items()
+                pin: int(v["value"]) for pin, v in msg["pins"].items()
             }
 
             s2 = gpio_values[SENSOR2]
@@ -309,25 +369,29 @@ async def gpio_listener(
 
             if rising_edge(last_gpio_values[SENSOR3], s3):
                 box_expected_by_ts = None
-                diagonal = measure_diagonal()
 
                 if horizontal is None:
-                    await asyncio.sleep(POST_MEASUREMENT_DELAY_SEC)
-                    await gpio_set(req, ARM, False)
-                elif diagonal > horizontal:
-                    await gpio_set(req, VACUUM, True)
-                    await gpio_set(req, ARM, False)
-                    await asyncio.sleep(VACUUM_HOLD_DELAY_SEC)
-                    await gpio_set(req, VACUUM, False)
+                    await reject_and_reset(req, intent_sock)
                 else:
-                    await asyncio.sleep(POST_MEASUREMENT_DELAY_SEC)
-                    await gpio_set(req, ARM, False)
+                    diagonal = measure_diagonal()
+                    if diagonal is None:
+                        await reject_and_reset(req, intent_sock)
+                    elif diagonal > horizontal:
+                        await push_intent(intent_sock, "accept")
+                        await gpio_set(req, VACUUM, True)
+                        await gpio_set(req, ARM, False)
+                        await asyncio.sleep(VACUUM_HOLD_DELAY_SEC)
+                        await gpio_set(req, VACUUM, False)
+                    else:
+                        await push_intent(intent_sock, "accept")
+                        await asyncio.sleep(POST_MEASUREMENT_DELAY_SEC)
+                        await gpio_set(req, ARM, False)
 
             if falling_edge(last_gpio_values[SENSOR3], s3):
                 await asyncio.sleep(RUNNING_RESET_DELAY_SEC)
                 running = False
-                log.info("Running=False")
-                box_expected_by_ts = None
+                horizontal = None
+                diagonal = None
                 await publish_state_if_changed(mqtt, gpio_values)
 
                 if s2 == 1:
@@ -342,7 +406,7 @@ async def gpio_listener(
 
 
 # =============================================================================
-# PUSHER HEARTBEAT LISTENER
+# HEARTBEAT LISTENERS
 # =============================================================================
 
 
@@ -358,6 +422,18 @@ async def pusher_listener(ctx: zmq.asyncio.Context) -> None:
         last_pusher_seen_ts = time.monotonic()
 
 
+async def sealer_listener(ctx: zmq.asyncio.Context) -> None:
+    global last_sealer_seen_ts
+
+    sub = ctx.socket(zmq.SUB)
+    sub.connect(SEALER_PUB_ADDR)
+    sub.setsockopt(zmq.SUBSCRIBE, SEALER_HEARTBEAT_TOPIC)
+
+    while True:
+        await sub.recv_multipart()
+        last_sealer_seen_ts = time.monotonic()
+
+
 # =============================================================================
 # ENTRY
 # =============================================================================
@@ -370,6 +446,7 @@ async def _amain() -> None:
         await asyncio.gather(
             gpio_listener(ctx, mqtt),
             pusher_listener(ctx),
+            sealer_listener(ctx),
             health_watchdog(mqtt),
         )
 
